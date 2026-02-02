@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"log/slog"
+	"magos/internal/filemanager"
 	"magos/internal/llm"
 	"magos/internal/tui"
 	"os"
@@ -23,7 +24,14 @@ func Execute() {
 		os.Exit(1)
 	}
 
-	p := tea.NewProgram(tui.InitialModel(logger, llmClient))
+	gitManager, err := filemanager.NewManager()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to initialize git manager: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Make sure you're running Magos in a git repository\n")
+		os.Exit(1)
+	}
+
+	p := tea.NewProgram(tui.InitialModel(logger, llmClient, gitManager))
 	if _, err := p.Run(); err != nil {
 		logger.Error("application error", "error", err)
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)

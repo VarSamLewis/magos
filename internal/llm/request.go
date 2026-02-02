@@ -44,10 +44,37 @@ func NewClient(logger *slog.Logger) (*Client, error) {
 func (c *Client) SendMessage(ctx context.Context, userMessage string) (*anthropic.Message, error) {
 	c.logger.Debug("sending message to Claude", "message_length", len(userMessage))
 
+	fileTree := []string{"main.go", "cmd/root.go", "internal/tui/model.go"}
+	systemPrompt := BuildSystemPrompt("/tmp", fileTree)
+	combinedMessage := systemPrompt + "\n\n---\n\n" + userMessage
+
 	message, err := c.anthropic.Messages.New(ctx, anthropic.MessageNewParams{
-		MaxTokens: 1024,
+		MaxTokens: 4096,
 		Messages: []anthropic.MessageParam{
-			anthropic.NewUserMessage(anthropic.NewTextBlock(userMessage)),
+			anthropic.NewUserMessage(anthropic.NewTextBlock(combinedMessage)),
+		},
+		Model: anthropic.ModelClaudeSonnet4_5_20250929,
+	})
+	if err != nil {
+		c.logger.Error("failed to send message to Claude", "error", err)
+		return nil, err
+	}
+
+	c.logger.Debug("received response from Claude", "content_blocks", len(message.Content))
+
+	return message, nil
+}
+
+// SendMessageWithSystem sends a user message with a system prompt prepended.
+func (c *Client) SendMessageWithSystem(ctx context.Context, userMessage, systemPrompt string) (*anthropic.Message, error) {
+	c.logger.Debug("sending message to Claude with system prompt", "message_length", len(userMessage), "system_length", len(systemPrompt))
+
+	combinedMessage := systemPrompt + "\n\n---\n\n" + userMessage
+
+	message, err := c.anthropic.Messages.New(ctx, anthropic.MessageNewParams{
+		MaxTokens: 4096,
+		Messages: []anthropic.MessageParam{
+			anthropic.NewUserMessage(anthropic.NewTextBlock(combinedMessage)),
 		},
 		Model: anthropic.ModelClaudeSonnet4_5_20250929,
 	})
