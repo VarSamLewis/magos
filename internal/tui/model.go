@@ -6,8 +6,8 @@ import (
 	"log/slog"
 	"magos/internal/filemanager"
 	"magos/internal/llm"
-	"strings"
 
+	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -27,13 +27,15 @@ type model struct {
 	gitManager      *filemanager.Manager
 	sessionID       string
 	maxPromptChains int
+	worktreeCreated bool
+	worktreePath    string
 }
 
 type llmResponseMsg struct {
 	response     string
 	err          error
 	chainCount   int
-	conversation []string
+	conversation []anthropic.MessageParam
 }
 
 // InitialModel creates and returns the initial TUI model state.
@@ -64,6 +66,8 @@ func InitialModel(logger *slog.Logger, llmClient *llm.Client, gitManager *filema
 		gitManager:      gitManager,
 		sessionID:       sessionID,
 		maxPromptChains: 3,
+		worktreeCreated: false,
+		worktreePath:    "",
 	}
 }
 
@@ -93,6 +97,37 @@ func (m *model) appendMessage(message string) {
 	m.viewport.GotoBottom()
 }
 
+// executeTool executes a single tool call and returns the result.
+func (m *model) executeTool(tool llm.ToolCall) (string, error) {
+	switch tool.Tool {
+	case "read_files", "read_file":
+		path, _ := tool.GetStringArg("path")
+		return llm.ExecuteReadFiles(m.gitManager.ProjectRoot(), path)
+
+	case "modify_files":
+		if !m.worktreeCreated {
+			m.appendDebug(fmt.Sprintf("[Git] Creating worktree (session: %s)", m.sessionID))
+			wtPath, err := m.gitManager.CreateWorktree(m.sessionID)
+			if err != nil {
+				return "", fmt.Errorf("failed to create worktree: %w", err)
+			}
+			m.worktreePath = wtPath
+			m.worktreeCreated = true
+			m.appendDebug(fmt.Sprintf("[Git] Created worktree at: %s", wtPath))
+		}
+
+		modifications, err := tool.GetFileModifications()
+		if err != nil {
+			return "", err
+		}
+
+		return llm.ExecuteModifyFiles(m.worktreePath, modifications)
+
+	default:
+		return "", fmt.Errorf("unknown tool: %s", tool.Tool)
+	}
+}
+
 // appendDebug adds a debug message to the debug viewport.
 func (m *model) appendDebug(message string) {
 	wrappedMsg := message
@@ -112,23 +147,24 @@ func (m *model) appendDebug(message string) {
 
 // sendLLMRequest sends a user message to Claude and returns a tea.Cmd that delivers the response.
 func sendLLMRequest(client *llm.Client, userMessage string, maxChains int) tea.Cmd {
-	return sendLLMRequestWithChain(client, userMessage, maxChains, 0, []string{})
+	history := []anthropic.MessageParam{
+		anthropic.NewUserMessage(anthropic.NewTextBlock(userMessage)),
+	}
+	return sendLLMRequestWithChain(client, history, maxChains, 0)
 }
 
-// sendLLMRequestWithChain handles prompt chaining by recursively calling the LLM.
-func sendLLMRequestWithChain(client *llm.Client, userMessage string, maxChains, currentChain int, conversation []string) tea.Cmd {
+// sendLLMRequestWithChain handles prompt chaining by sending the accumulated
+// message history and returning the response for the TUI to process.
+func sendLLMRequestWithChain(client *llm.Client, history []anthropic.MessageParam, maxChains, currentChain int) tea.Cmd {
 	return func() tea.Msg {
 		ctx := context.Background()
 
-		conversationHistory := append(conversation, userMessage)
-		fullMessage := strings.Join(conversationHistory, "\n\n---\n\n")
-
-		message, err := client.SendMessage(ctx, fullMessage)
+		message, err := client.SendMessage(ctx, history)
 		if err != nil {
 			return llmResponseMsg{
 				err:          err,
 				chainCount:   currentChain,
-				conversation: conversationHistory,
+				conversation: history,
 			}
 		}
 
@@ -137,22 +173,13 @@ func sendLLMRequestWithChain(client *llm.Client, userMessage string, maxChains, 
 			responseText += block.Text
 		}
 
-		conversationHistory = append(conversationHistory, responseText)
-
-		toolCalls := llm.ParseToolCalls(responseText)
-
-		if len(toolCalls) > 0 && currentChain < maxChains {
-			return llmResponseMsg{
-				response:     responseText,
-				chainCount:   currentChain + 1,
-				conversation: conversationHistory,
-			}
-		}
+		// Append the assistant's response to history.
+		history = append(history, anthropic.NewAssistantMessage(anthropic.NewTextBlock(responseText)))
 
 		return llmResponseMsg{
 			response:     responseText,
 			chainCount:   currentChain,
-			conversation: conversationHistory,
+			conversation: history,
 		}
 	}
 }
@@ -209,10 +236,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				toolResults := ""
 				for _, tool := range toolCalls {
 					m.appendDebug(fmt.Sprintf("[Tool] Executing: %s", tool.Tool))
-					toolResults += fmt.Sprintf("\nTool: %s\nResult: Tool not implemented yet\n", tool.Tool)
+
+					result, err := m.executeTool(tool)
+					if err != nil {
+						m.appendDebug(fmt.Sprintf("[Tool] Error: %s", err))
+						toolResults += fmt.Sprintf("\nTool: %s\nError: %s\n", tool.Tool, err)
+					} else {
+						m.appendDebug(fmt.Sprintf("[Tool] Success"))
+						toolResults += fmt.Sprintf("\nTool: %s\nResult: %s\n", tool.Tool, result)
+					}
 				}
 
-				return m, sendLLMRequestWithChain(m.llmClient, toolResults, m.maxPromptChains, msg.chainCount+1, msg.conversation)
+				history := append(msg.conversation, anthropic.NewUserMessage(anthropic.NewTextBlock(toolResults)))
+			return m, sendLLMRequestWithChain(m.llmClient, history, m.maxPromptChains, msg.chainCount+1)
 			}
 		} else {
 			m.appendDebug("[LLM] No tool calls found, chain complete")
@@ -221,19 +257,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		responseMsg := fmt.Sprintf("Magos: %s", msg.response)
 		m.appendMessage(responseMsg)
 
-		m.appendDebug(fmt.Sprintf("[Git] Merging worktree (session: %s)", m.sessionID))
-		if err := m.gitManager.MergeWorktree(m.sessionID); err != nil {
-			m.appendDebug(fmt.Sprintf("[Git] Merge error: %s", err))
-			m.appendMessage(fmt.Sprintf("Git Merge Error: %s", err))
-		} else {
-			m.appendDebug("[Git] Merge successful")
-		}
+		if m.worktreeCreated {
+			m.appendDebug(fmt.Sprintf("[Git] Merging worktree (session: %s)", m.sessionID))
+			if err := m.gitManager.MergeWorktree(m.sessionID); err != nil {
+				m.appendDebug(fmt.Sprintf("[Git] Merge error: %s", err))
+				m.appendMessage(fmt.Sprintf("Git Merge Error: %s", err))
+			} else {
+				m.appendDebug("[Git] Merge successful")
+			}
 
-		m.appendDebug(fmt.Sprintf("[Git] Cleaning up worktree (session: %s)", m.sessionID))
-		if err := m.gitManager.CleanupWorktree(m.sessionID); err != nil {
-			m.appendDebug(fmt.Sprintf("[Git] Cleanup error: %s", err))
+			m.appendDebug(fmt.Sprintf("[Git] Cleaning up worktree (session: %s)", m.sessionID))
+			if err := m.gitManager.CleanupWorktree(m.sessionID); err != nil {
+				m.appendDebug(fmt.Sprintf("[Git] Cleanup error: %s", err))
+			} else {
+				m.appendDebug("[Git] Cleanup successful")
+			}
+
+			m.worktreeCreated = false
+			m.worktreePath = ""
 		} else {
-			m.appendDebug("[Git] Cleanup successful")
+			m.appendDebug("[Git] No worktree created, skipping merge/cleanup")
 		}
 
 		return m, nil

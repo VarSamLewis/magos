@@ -16,6 +16,18 @@ type Manager struct {
 	locks       sync.Map
 }
 
+// ProjectRoot returns the project root directory.
+func (m *Manager) ProjectRoot() string {
+	return m.projectRoot
+}
+
+// WorktreeExists checks if a worktree already exists for the given session.
+func (m *Manager) WorktreeExists(sessionID string) bool {
+	wtPath := filepath.Join(m.projectRoot, ".magos", "wt_"+sessionID)
+	_, err := os.Stat(wtPath)
+	return err == nil
+}
+
 // WorktreeInfo contains information about a git worktree.
 type WorktreeInfo struct {
 	Path      string
@@ -64,6 +76,10 @@ func (m *Manager) CreateWorktree(sessionID string) (string, error) {
 	wtPath := filepath.Join(magosDir, "wt_"+sessionID)
 	branchName := "magos/" + sessionID
 
+	if err := m.cleanupStale(sessionID); err != nil {
+		return "", fmt.Errorf("failed to cleanup stale worktree: %w", err)
+	}
+
 	cmd := exec.Command("git", "worktree", "add", wtPath, "-b", branchName)
 	cmd.Dir = m.projectRoot
 
@@ -73,6 +89,24 @@ func (m *Manager) CreateWorktree(sessionID string) (string, error) {
 	}
 
 	return wtPath, nil
+}
+
+// cleanupStale removes any existing worktree and branch for the session.
+func (m *Manager) cleanupStale(sessionID string) error {
+	wtPath := filepath.Join(m.projectRoot, ".magos", "wt_"+sessionID)
+	branchName := "magos/" + sessionID
+
+	if _, err := os.Stat(wtPath); err == nil {
+		removeCmd := exec.Command("git", "worktree", "remove", wtPath, "--force")
+		removeCmd.Dir = m.projectRoot
+		removeCmd.Run()
+	}
+
+	branchCmd := exec.Command("git", "branch", "-D", branchName)
+	branchCmd.Dir = m.projectRoot
+	branchCmd.Run()
+
+	return nil
 }
 
 // MergeWorktree merges the worktree's branch back to main.

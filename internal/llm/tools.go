@@ -3,6 +3,8 @@ package llm
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 )
@@ -28,9 +30,11 @@ func BuildSystemPrompt(projectRoot string, fileTree []string) string {
 
 ## Available Tools
 
-### read_file
-Read the contents of a file from the project.
-Input: {"tool": "read_file", "path": "relative/path/to/file.go"}
+### read_files
+Read the contents of files from the project.
+Input: {"tool": "read_files", "path": "relative/path/to/file.go"}
+If path is empty or a directory, reads all files in that directory.
+If path is a file, reads that specific file.
 Output: File contents
 
 ### modify_files
@@ -163,4 +167,105 @@ func (tc *ToolCall) GetFileModifications() ([]FileModification, error) {
 	}
 
 	return modifications, nil
+}
+
+// ExecuteReadFiles reads files from the specified path.
+func ExecuteReadFiles(projectRoot, path string) (string, error) {
+	targetPath := filepath.Join(projectRoot, path)
+
+	if path == "" {
+		return readAllFiles(projectRoot)
+	}
+
+	info, err := os.Stat(targetPath)
+	if err != nil {
+		return "", fmt.Errorf("path not found: %s", path)
+	}
+
+	if info.IsDir() {
+		return readAllFiles(targetPath)
+	}
+
+	content, err := os.ReadFile(targetPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to read file %s: %w", path, err)
+	}
+
+	return fmt.Sprintf("File: %s\n\n%s", path, string(content)), nil
+}
+
+// maxReadBytes is the total byte budget for readAllFiles output.
+const maxReadBytes = 100_000
+
+// readAllFiles recursively reads all files in a directory.
+func readAllFiles(dir string) (string, error) {
+	var result strings.Builder
+	var fileCount int
+
+	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if info.IsDir() {
+			if info.Name() == ".git" || info.Name() == ".magos" || info.Name() == "node_modules" || info.Name() == "vendor" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		if result.Len() >= maxReadBytes {
+			return filepath.SkipAll
+		}
+
+		relPath, _ := filepath.Rel(dir, path)
+
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+
+		remaining := maxReadBytes - result.Len()
+		if len(content) > remaining {
+			content = content[:remaining]
+			result.WriteString(fmt.Sprintf("\n--- File: %s (truncated) ---\n%s\n", relPath, string(content)))
+		} else {
+			result.WriteString(fmt.Sprintf("\n--- File: %s ---\n%s\n", relPath, string(content)))
+		}
+		fileCount++
+
+		return nil
+	})
+
+	if err != nil {
+		return "", err
+	}
+
+	return fmt.Sprintf("Read %d files:\n%s", fileCount, result.String()), nil
+}
+
+// ExecuteModifyFiles writes files to the worktree path.
+func ExecuteModifyFiles(worktreePath string, modifications []FileModification) (string, error) {
+	if worktreePath == "" {
+		return "", fmt.Errorf("worktree path not provided")
+	}
+
+	var results []string
+
+	for _, mod := range modifications {
+		targetPath := filepath.Join(worktreePath, mod.Path)
+
+		dir := filepath.Dir(targetPath)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return "", fmt.Errorf("failed to create directory for %s: %w", mod.Path, err)
+		}
+
+		if err := os.WriteFile(targetPath, []byte(mod.Content), 0644); err != nil {
+			return "", fmt.Errorf("failed to write file %s: %w", mod.Path, err)
+		}
+
+		results = append(results, mod.Path)
+	}
+
+	return fmt.Sprintf("Modified %d file(s): %s", len(results), strings.Join(results, ", ")), nil
 }

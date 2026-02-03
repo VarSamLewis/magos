@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"log/slog"
+	"magos/internal/db"
 	"magos/internal/filemanager"
 	"magos/internal/llm"
 	"magos/internal/tui"
@@ -13,21 +14,27 @@ import (
 
 // Execute initializes the application services and launches the TUI.
 func Execute() {
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-		Level: slog.LevelError,
-	}))
+	gitManager, err := filemanager.NewManager()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to initialize git manager: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Make sure you're running Magos in a git repository\n")
+		os.Exit(1)
+	}
+
+	logDB, err := db.NewLogDB(gitManager.ProjectRoot())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to initialize log database: %v\n", err)
+		os.Exit(1)
+	}
+	defer logDB.Close()
+
+	sqliteHandler := db.NewSQLiteHandler(logDB, slog.LevelDebug)
+	logger := slog.New(sqliteHandler)
 
 	llmClient, err := llm.NewClient(logger)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to initialize LLM client: %v\n", err)
 		fmt.Fprintf(os.Stderr, "Please set MAGOS_ANTHROPIC_API_KEY environment variable\n")
-		os.Exit(1)
-	}
-
-	gitManager, err := filemanager.NewManager()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to initialize git manager: %v\n", err)
-		fmt.Fprintf(os.Stderr, "Make sure you're running Magos in a git repository\n")
 		os.Exit(1)
 	}
 
