@@ -2,10 +2,13 @@ package tui
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"magos/internal/executor"
 	"magos/internal/filemanager"
 	"magos/internal/llm"
+	"magos/internal/validation"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/charmbracelet/bubbles/textarea"
@@ -97,37 +100,6 @@ func (m *model) appendMessage(message string) {
 	m.viewport.GotoBottom()
 }
 
-// executeTool executes a single tool call and returns the result.
-func (m *model) executeTool(tool llm.ToolCall) (string, error) {
-	switch tool.Tool {
-	case "read_files", "read_file":
-		path, _ := tool.GetStringArg("path")
-		return llm.ExecuteReadFiles(m.gitManager.ProjectRoot(), path)
-
-	case "modify_files":
-		if !m.worktreeCreated {
-			m.appendDebug(fmt.Sprintf("[Git] Creating worktree (session: %s)", m.sessionID))
-			wtPath, err := m.gitManager.CreateWorktree(m.sessionID)
-			if err != nil {
-				return "", fmt.Errorf("failed to create worktree: %w", err)
-			}
-			m.worktreePath = wtPath
-			m.worktreeCreated = true
-			m.appendDebug(fmt.Sprintf("[Git] Created worktree at: %s", wtPath))
-		}
-
-		modifications, err := tool.GetFileModifications()
-		if err != nil {
-			return "", err
-		}
-
-		return llm.ExecuteModifyFiles(m.worktreePath, modifications)
-
-	default:
-		return "", fmt.Errorf("unknown tool: %s", tool.Tool)
-	}
-}
-
 // appendDebug adds a debug message to the debug viewport.
 func (m *model) appendDebug(message string) {
 	wrappedMsg := message
@@ -168,13 +140,35 @@ func sendLLMRequestWithChain(client *llm.Client, history []anthropic.MessagePara
 			}
 		}
 
+		// Build response text and content blocks for history
 		var responseText string
+		var contentBlocks []anthropic.ContentBlockParamUnion
+
 		for _, block := range message.Content {
-			responseText += block.Text
+			// Handle text blocks
+			if block.Text != "" {
+				responseText += block.Text
+				contentBlocks = append(contentBlocks, anthropic.ContentBlockParamUnion{
+					OfText: &anthropic.TextBlockParam{
+						Text: block.Text,
+					},
+				})
+			}
+
+			// Handle tool use blocks (check the Type field)
+			if block.Type == "tool_use" {
+				contentBlocks = append(contentBlocks, anthropic.ContentBlockParamUnion{
+					OfToolUse: &anthropic.ToolUseBlockParam{
+						ID:    block.ID,
+						Name:  block.Name,
+						Input: block.Input,
+					},
+				})
+			}
 		}
 
-		// Append the assistant's response to history.
-		history = append(history, anthropic.NewAssistantMessage(anthropic.NewTextBlock(responseText)))
+		// Append the full assistant message to history
+		history = append(history, anthropic.NewAssistantMessage(contentBlocks...))
 
 		return llmResponseMsg{
 			response:     responseText,
@@ -222,42 +216,160 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-		m.logger.Debug("received LLM response", "length", len(msg.response), "chain", msg.chainCount)
-		m.appendDebug(fmt.Sprintf("[LLM] Chain %d - Response (%d chars)", msg.chainCount+1, len(msg.response)))
+		m.logger.Debug("received LLM response",
+			"chain", msg.chainCount,
+			"response_len", len(msg.response))
 
-		toolCalls := llm.ParseToolCalls(msg.response)
+		// Get the last assistant message from conversation
+		lastMsg := msg.conversation[len(msg.conversation)-1]
 
-		if len(toolCalls) > 0 {
-			if msg.chainCount >= m.maxPromptChains {
-				m.appendDebug(fmt.Sprintf("[LLM] Max chains (%d) reached, stopping despite tool calls", m.maxPromptChains))
-			} else {
-				m.appendDebug(fmt.Sprintf("[LLM] Found %d tool call(s), continuing chain...", len(toolCalls)))
+		// Check if the response contains tool use
+		hasToolUse := false
+		var textResponse string
+		var toolCalls []executor.ToolCall
 
-				toolResults := ""
-				for _, tool := range toolCalls {
-					m.appendDebug(fmt.Sprintf("[Tool] Executing: %s", tool.Tool))
-
-					result, err := m.executeTool(tool)
-					if err != nil {
-						m.appendDebug(fmt.Sprintf("[Tool] Error: %s", err))
-						toolResults += fmt.Sprintf("\nTool: %s\nError: %s\n", tool.Tool, err)
-					} else {
-						m.appendDebug(fmt.Sprintf("[Tool] Success"))
-						toolResults += fmt.Sprintf("\nTool: %s\nResult: %s\n", tool.Tool, result)
-					}
+		// Parse the content blocks from the assistant message
+		if lastMsg.Role == anthropic.MessageParamRoleAssistant {
+			for _, contentBlock := range lastMsg.Content {
+				// Handle text blocks
+				if contentBlock.OfText != nil {
+					textResponse += contentBlock.OfText.Text
 				}
 
-				history := append(msg.conversation, anthropic.NewUserMessage(anthropic.NewTextBlock(toolResults)))
-			return m, sendLLMRequestWithChain(m.llmClient, history, m.maxPromptChains, msg.chainCount+1)
+				// Handle tool use blocks
+				if contentBlock.OfToolUse != nil {
+					hasToolUse = true
+
+					// Extract command and explanation from tool input
+					// Input is 'any' type - try to assert it to map first
+					var input map[string]interface{}
+
+					// Try direct map assertion first
+					if inputMap, ok := contentBlock.OfToolUse.Input.(map[string]interface{}); ok {
+						input = inputMap
+					} else if rawMsg, ok := contentBlock.OfToolUse.Input.(json.RawMessage); ok {
+						// If it's json.RawMessage, unmarshal it
+						if err := json.Unmarshal(rawMsg, &input); err != nil {
+							m.appendDebug(fmt.Sprintf("[LLM] Failed to parse tool input: %s", err))
+							continue
+						}
+					} else {
+						m.appendDebug(fmt.Sprintf("[LLM] Unexpected tool input type: %T", contentBlock.OfToolUse.Input))
+						continue
+					}
+
+					command, ok := input["command"].(string)
+					if !ok {
+						m.appendDebug("[LLM] Tool input missing 'command' field")
+						continue
+					}
+
+					explanation := ""
+					if exp, ok := input["explanation"].(string); ok {
+						explanation = exp
+					}
+
+					toolCalls = append(toolCalls, executor.ToolCall{
+						ID:          contentBlock.OfToolUse.ID,
+						Name:        contentBlock.OfToolUse.Name,
+						Command:     command,
+						Explanation: explanation,
+					})
+
+					m.appendDebug(fmt.Sprintf("[LLM] Tool call: %s", explanation))
+				}
 			}
-		} else {
-			m.appendDebug("[LLM] No tool calls found, chain complete")
 		}
 
-		responseMsg := fmt.Sprintf("Magos: %s", msg.response)
-		m.appendMessage(responseMsg)
+		// Display text response if any
+		if textResponse != "" {
+			m.appendMessage(fmt.Sprintf("Magos: %s", textResponse))
+		}
+
+		// Execute tool calls if present
+		if hasToolUse && len(toolCalls) > 0 {
+			m.appendDebug(fmt.Sprintf("[Executor] Executing %d tool call(s)", len(toolCalls)))
+
+			exec := executor.NewExecutor(m.logger, m.worktreePath)
+			ctx := context.Background()
+
+			// Build tool results for next LLM turn
+			var toolResultBlocks []anthropic.ContentBlockParamUnion
+
+			for i, toolCall := range toolCalls {
+				// Execute the command
+				result := exec.Execute(ctx, toolCall)
+
+				m.appendDebug(fmt.Sprintf("[Executor] Tool %d: exit=%d, duration=%dms",
+					i+1, result.ExitCode, result.Duration.Milliseconds()))
+
+				// Display result to user
+				m.appendMessage(executor.FormatResultForDisplay(result))
+
+				// Build tool_result for LLM
+				toolResultBlocks = append(toolResultBlocks, anthropic.ContentBlockParamUnion{
+					OfToolResult: &anthropic.ToolResultBlockParam{
+						ToolUseID: result.ToolCallID,
+						Content: []anthropic.ToolResultBlockParamContentUnion{
+							{
+								OfText: &anthropic.TextBlockParam{
+									Text: executor.FormatResultForToolResponse(result),
+								},
+							},
+						},
+					},
+				})
+			}
+
+			// Continue conversation with tool results if we haven't exceeded max chains
+			if msg.chainCount < m.maxPromptChains {
+				m.appendDebug(fmt.Sprintf("[LLM] Sending tool results back (chain %d/%d)",
+					msg.chainCount+2, m.maxPromptChains))
+
+				return m, sendLLMRequestWithChain(
+					m.llmClient,
+					append(msg.conversation, anthropic.NewUserMessage(toolResultBlocks...)),
+					m.maxPromptChains,
+					msg.chainCount+1,
+				)
+			} else {
+				m.appendDebug("[LLM] Max prompt chains reached, stopping")
+			}
+		} else if msg.response != "" {
+			m.appendMessage(fmt.Sprintf("Magos: %s", msg.response))
+		}
 
 		if m.worktreeCreated {
+			// Run validation before merging
+			m.appendDebug("[Validation] Running validators on worktree...")
+			runner, err := validation.NewRunner(m.worktreePath)
+			if err != nil {
+				m.appendDebug(fmt.Sprintf("[Validation] Runner creation failed: %s", err))
+				m.appendMessage(fmt.Sprintf("Validation setup error: %s", err))
+			} else {
+				result, err := runner.Run()
+				if err != nil {
+					m.appendDebug(fmt.Sprintf("[Validation] Execution failed: %s", err))
+					m.appendMessage(fmt.Sprintf("Validation error: %s", err))
+				} else if !result.Passed {
+					m.appendDebug(fmt.Sprintf("[Validation] FAILED - found issues"))
+					validationMsg := fmt.Sprintf("Validation Failed:\n%s", result.FormatForLLM())
+					m.appendMessage(validationMsg)
+
+					// Don't merge if validation fails
+					m.appendDebug("[Git] Skipping merge due to validation failure")
+					m.appendDebug(fmt.Sprintf("[Git] Cleaning up worktree (session: %s)", m.sessionID))
+					if err := m.gitManager.CleanupWorktree(m.sessionID); err != nil {
+						m.appendDebug(fmt.Sprintf("[Git] Cleanup error: %s", err))
+					}
+					m.worktreeCreated = false
+					m.worktreePath = ""
+					return m, nil
+				} else {
+					m.appendDebug("[Validation] PASSED - all checks successful")
+				}
+			}
+
 			m.appendDebug(fmt.Sprintf("[Git] Merging worktree (session: %s)", m.sessionID))
 			if err := m.gitManager.MergeWorktree(m.sessionID); err != nil {
 				m.appendDebug(fmt.Sprintf("[Git] Merge error: %s", err))
@@ -303,6 +415,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 				m.appendDebug(fmt.Sprintf("[Git] Created worktree at: %s", wtPath))
+				m.worktreeCreated = true
+				m.worktreePath = wtPath
 
 				m.textarea.Reset()
 
