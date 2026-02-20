@@ -38,7 +38,10 @@ func Execute() {
 		os.Exit(1)
 	}
 
-	p := tea.NewProgram(tui.InitialModel(logger, llmClient, gitManager))
+	p := tea.NewProgram(
+		tui.InitialModel(logger, llmClient, gitManager),
+		tea.WithAltScreen(),
+	)
 	if _, err := p.Run(); err != nil {
 		logger.Error("application error", "error", err)
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)

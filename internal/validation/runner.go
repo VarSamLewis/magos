@@ -42,11 +42,29 @@ func (r *Runner) detectAndAddValidators() error {
 		filepath.Join(r.projectPath, "setup.py"),
 	}
 
+	hasPythonProject := false
 	for _, f := range pythonFiles {
 		if _, err := os.Stat(f); err == nil {
-			r.validators = append(r.validators, NewPythonValidator(r.projectPath))
+			hasPythonProject = true
 			break
 		}
+	}
+
+	// Also check for any .py files in the project
+	if !hasPythonProject {
+		entries, err := os.ReadDir(r.projectPath)
+		if err == nil {
+			for _, entry := range entries {
+				if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".py") {
+					hasPythonProject = true
+					break
+				}
+			}
+		}
+	}
+
+	if hasPythonProject {
+		r.validators = append(r.validators, NewPythonValidator(r.projectPath))
 	}
 
 	// TODO: Add Go detection (go.mod)
