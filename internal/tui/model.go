@@ -8,7 +8,10 @@ import (
 	"magos/internal/executor"
 	"magos/internal/filemanager"
 	"magos/internal/llm"
+	"magos/internal/sandbox"
 	"magos/internal/validation"
+	"os"
+	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/charmbracelet/bubbles/textarea"
@@ -32,6 +35,9 @@ type model struct {
 	maxPromptChains int
 	worktreeCreated bool
 	worktreePath    string
+	autoStartPrompt string
+	sandbox         *sandbox.Sandbox
+	apiKey          string
 }
 
 type llmResponseMsg struct {
@@ -59,6 +65,9 @@ func InitialModel(logger *slog.Logger, llmClient *llm.Client, gitManager *filema
 
 	logger.Info("initialized TUI model", "session_id", sessionID)
 
+	cfg := sandbox.DefaultConfig()
+	sb := sandbox.NewSandbox(logger, cfg)
+
 	return model{
 		textarea:        ta,
 		viewport:        vp,
@@ -71,11 +80,48 @@ func InitialModel(logger *slog.Logger, llmClient *llm.Client, gitManager *filema
 		maxPromptChains: 3,
 		worktreeCreated: false,
 		worktreePath:    "",
+		sandbox:         sb,
+		apiKey:          os.Getenv("MAGOS_ANTHROPIC_API_KEY"),
 	}
+}
+
+// InitialModelSandbox creates a model for running inside the VM sandbox.
+// It runs the provided prompt through the LLM and exits when done.
+func InitialModelSandbox(logger *slog.Logger, llmClient *llm.Client, gitManager *filemanager.Manager, worktreePath, prompt string) model {
+	vp := viewport.New(80, 20)
+	vp.SetContent("Running in sandbox mode...")
+
+	debugVp := viewport.New(80, 3)
+	debugVp.SetContent("")
+
+	sessionID := uuid.New().String()[:8]
+
+	logger.Info("initialized sandbox model", "session_id", sessionID, "worktree", worktreePath)
+
+	m := model{
+		textarea:        textarea.Model{},
+		viewport:        vp,
+		debugView:       debugVp,
+		ready:           true,
+		logger:          logger,
+		llmClient:       llmClient,
+		gitManager:      gitManager,
+		sessionID:       sessionID,
+		maxPromptChains: 3,
+		worktreeCreated: true,
+		worktreePath:    worktreePath,
+		autoStartPrompt: prompt,
+	}
+
+	return m
 }
 
 // Init initializes the TUI and returns the initial command.
 func (m model) Init() tea.Cmd {
+	// If there's an auto-start prompt (sandbox mode), start the LLM request immediately
+	if m.autoStartPrompt != "" {
+		return sendLLMRequest(m.llmClient, m.autoStartPrompt, m.maxPromptChains)
+	}
 	return textarea.Blink
 }
 
@@ -340,6 +386,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		if m.worktreeCreated {
+			// In sandbox mode, skip git operations - just exit after LLM loop
+			if m.autoStartPrompt != "" {
+				m.appendDebug("[Sandbox] LLM loop complete, exiting...")
+				return m, tea.Quit
+			}
+
 			// Run validation before merging
 			m.appendDebug("[Validation] Running validators on worktree...")
 			runner, err := validation.NewRunner(m.worktreePath)
@@ -397,6 +449,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "ctrl+c", "esc":
 			m.logger.Info("user quit application")
+			if m.sandbox != nil {
+				m.sandbox.Stop()
+			}
 			return m, tea.Quit
 		case "enter":
 			userInput := m.textarea.Value()
@@ -420,7 +475,79 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 				m.textarea.Reset()
 
-				return m, sendLLMRequest(m.llmClient, userInput, m.maxPromptChains)
+				m.appendMessage("Starting sandbox VM...")
+				m.appendDebug("[Sandbox] Starting VM with workspace...")
+
+				if err := m.sandbox.Start(wtPath, userInput, m.apiKey); err != nil {
+					m.appendDebug(fmt.Sprintf("[Sandbox] Error: %s", err))
+					m.appendMessage(fmt.Sprintf("Sandbox Error: %s", err))
+					m.gitManager.CleanupWorktree(m.sessionID)
+					return m, nil
+				}
+
+				m.appendMessage("Running in sandbox VM... (this may take a while)")
+				m.appendDebug("[Sandbox] Waiting for VM to complete...")
+
+				waitErr := m.sandbox.Wait(time.Duration(sandbox.DefaultConfig().Timeout) * time.Second)
+				if waitErr != nil {
+					m.appendDebug(fmt.Sprintf("[Sandbox] Wait error: %s", waitErr))
+					m.appendMessage(fmt.Sprintf("VM Error: %s", waitErr))
+				}
+
+				m.appendDebug("[Sandbox] Extracting changes from workspace...")
+				if err := m.sandbox.ExtractChanges(); err != nil {
+					m.appendDebug(fmt.Sprintf("[Sandbox] Extract error: %s", err))
+					m.appendMessage(fmt.Sprintf("Extract Error: %s", err))
+				}
+
+				m.appendDebug("[Sandbox] Stopping VM...")
+				m.sandbox.Stop()
+
+				m.appendMessage("Sandbox complete. Running validation...")
+
+				m.appendDebug("[Validation] Running validators on worktree...")
+				runner, err := validation.NewRunner(m.worktreePath)
+				if err != nil {
+					m.appendDebug(fmt.Sprintf("[Validation] Runner creation failed: %s", err))
+					m.appendMessage(fmt.Sprintf("Validation setup error: %s", err))
+				} else {
+					result, err := runner.Run()
+					if err != nil {
+						m.appendDebug(fmt.Sprintf("[Validation] Execution failed: %s", err))
+						m.appendMessage(fmt.Sprintf("Validation error: %s", err))
+					} else if !result.Passed {
+						m.appendDebug(fmt.Sprintf("[Validation] FAILED - found issues"))
+						validationMsg := fmt.Sprintf("Validation Failed:\n%s", result.FormatForLLM())
+						m.appendMessage(validationMsg)
+
+						m.appendDebug("[Git] Skipping merge due to validation failure")
+						m.appendDebug(fmt.Sprintf("[Git] Cleaning up worktree (session: %s)", m.sessionID))
+						m.gitManager.CleanupWorktree(m.sessionID)
+						m.worktreeCreated = false
+						m.worktreePath = ""
+						return m, nil
+					} else {
+						m.appendDebug("[Validation] PASSED - all checks successful")
+						m.appendMessage("Validation passed!")
+					}
+				}
+
+				m.appendDebug(fmt.Sprintf("[Git] Merging worktree (session: %s)", m.sessionID))
+				if err := m.gitManager.MergeWorktree(m.sessionID); err != nil {
+					m.appendDebug(fmt.Sprintf("[Git] Merge error: %s", err))
+					m.appendMessage(fmt.Sprintf("Git Merge Error: %s", err))
+				} else {
+					m.appendDebug("[Git] Merge successful")
+					m.appendMessage("Changes merged to main!")
+				}
+
+				m.appendDebug(fmt.Sprintf("[Git] Cleaning up worktree (session: %s)", m.sessionID))
+				m.gitManager.CleanupWorktree(m.sessionID)
+
+				m.worktreeCreated = false
+				m.worktreePath = ""
+
+				return m, nil
 			}
 
 			m.textarea, tiCmd = m.textarea.Update(msg)
@@ -475,4 +602,3 @@ func (m model) View() string {
 		helpText,
 	)
 }
-
